@@ -92,6 +92,25 @@ bool shardIsStale(const LoadedShard &LS, llvm::vfs::FileSystem *FS) {
   return digest(Buf->get()->getBuffer()) != LS.Digest;
 }
 
+// Whether the translation unit of the shard was indexed with another compile
+// command than it has now.
+bool commandChanged(const LoadedShard &LS, const GlobalCompilationDatabase &CDB,
+                    const std::function<Context(PathRef)> &ContextProvider) {
+  // Only the shard of a translation unit has its command.
+  if (!LS.Shard || !LS.Shard->Cmd)
+    return false;
+  // The command depends on the config, as it does when the file is indexed.
+  std::optional<WithContext> WithProvidedContext;
+  if (ContextProvider)
+    WithProvidedContext.emplace(ContextProvider(LS.AbsolutePath));
+  auto Cmd = CDB.getCompileCommand(LS.AbsolutePath);
+  // Without a command, the file cannot be indexed again.
+  if (!Cmd)
+    return false;
+  return Cmd->CommandLine != LS.Shard->Cmd->CommandLine ||
+         Cmd->Directory != LS.Shard->Cmd->Directory;
+}
+
 } // namespace
 
 BackgroundIndex::BackgroundIndex(
@@ -369,6 +388,12 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles) {
   // Load shards for all of the mainfiles.
   const std::vector<LoadedShard> Result =
       loadIndexShards(MainFiles, IndexStorageFactory, CDB);
+  // The translation units that were indexed with another command. Their
+  // symbols are good to start with, but they are not up to date.
+  llvm::StringSet<> CommandChanged;
+  for (auto &LS : Result)
+    if (commandChanged(LS, CDB, ContextProvider))
+      CommandChanged.insert(LS.AbsolutePath);
   size_t LoadedShards = 0;
   {
     // Update in-memory state.
@@ -387,9 +412,12 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles) {
           LS.Shard->Relations
               ? std::make_unique<RelationSlab>(std::move(*LS.Shard->Relations))
               : nullptr;
-      ShardVersion &SV = ShardVersions[LS.AbsolutePath];
-      SV.Digest = LS.Digest;
-      SV.HadErrors = LS.HadErrors;
+      // Without a version, indexing does not skip the file as unchanged.
+      if (!CommandChanged.contains(LS.AbsolutePath)) {
+        ShardVersion &SV = ShardVersions[LS.AbsolutePath];
+        SV.Digest = LS.Digest;
+        SV.HadErrors = LS.HadErrors;
+      }
       ++LoadedShards;
 
       IndexedSymbols.update(URI::create(LS.AbsolutePath).toString(),
@@ -405,7 +433,8 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles) {
   // We'll accept data from stale shards, but ensure the files get reindexed
   // soon.
   for (auto &LS : Result) {
-    if (!shardIsStale(LS, FS.get()))
+    if (!shardIsStale(LS, FS.get()) &&
+        !CommandChanged.contains(LS.AbsolutePath))
       continue;
     PathRef TUForFile = LS.DependentTU;
     assert(!TUForFile.empty() && "File without a TU!");
