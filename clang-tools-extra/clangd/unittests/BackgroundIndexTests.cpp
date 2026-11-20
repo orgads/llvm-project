@@ -796,6 +796,60 @@ TEST_F(BackgroundIndexTest, MainFileWithOtherSlashes) {
                                    AllOf(named("g"), numReferences(1U))));
 }
 
+TEST_F(BackgroundIndexTest, CmdLineChange) {
+  MockFS FS;
+  FS.Files[testPath("root/A.cc")] = R"cpp(
+      #ifdef NEW
+      void f_new();
+      #else
+      void f_old();
+      #endif
+      )cpp";
+
+  struct CountingStorage : MemoryShardStorage {
+    using MemoryShardStorage::MemoryShardStorage;
+    llvm::Error storeShard(llvm::StringRef ShardIdentifier,
+                           IndexFileOut Shard) const override {
+      ++Stored;
+      return MemoryShardStorage::storeShard(ShardIdentifier, Shard);
+    }
+    mutable std::atomic<unsigned> Stored = {0};
+  };
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  CountingStorage MSS(Storage, CacheHits);
+
+  tooling::CompileCommand Cmd;
+  Cmd.Filename = testPath("root/A.cc");
+  Cmd.Directory = testPath("root");
+  Cmd.CommandLine = {"clang++", testPath("root/A.cc")};
+  auto IndexWithCommand = [&] {
+    OverlayCDB CDB(/*Base=*/nullptr);
+    BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
+                        /*Opts=*/{});
+    CDB.setCompileCommand(testPath("root/A.cc"), Cmd);
+    ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  };
+  IndexWithCommand();
+  EXPECT_EQ(MSS.Stored, 1U);
+  auto Shard = MSS.loadShard(testPath("root/A.cc"));
+  ASSERT_NE(Shard, nullptr);
+  EXPECT_THAT(*Shard->Symbols, UnorderedElementsAre(named("f_old")));
+
+  // The same command: the shard is good as it is.
+  IndexWithCommand();
+  EXPECT_EQ(MSS.Stored, 1U);
+
+  // Another command: the file is indexed again, although it did not change.
+  Cmd.CommandLine.push_back("-DNEW");
+  IndexWithCommand();
+  EXPECT_EQ(MSS.Stored, 2U);
+  Shard = MSS.loadShard(testPath("root/A.cc"));
+  ASSERT_NE(Shard, nullptr);
+  EXPECT_THAT(*Shard->Symbols, UnorderedElementsAre(named("f_new")));
+  EXPECT_EQ(Shard->Cmd->CommandLine, Cmd.CommandLine);
+}
+
 TEST_F(BackgroundIndexTest, Reindex) {
   MockFS FS;
   llvm::StringMap<std::string> Storage;
